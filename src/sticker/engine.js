@@ -230,6 +230,52 @@ export function canvasToBlob(canvas, type = "image/webp", quality = 0.85) {
   return new Promise((resolve) => canvas.toBlob((b) => resolve(b), type, quality));
 }
 
+/** Fraction of pixels that are (near-)transparent. >0.02 ≈ real cutout. */
+export function transparencyRatio(canvas, sampleStep = 8) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const { width: w, height: h } = canvas;
+  let clear = 0;
+  let total = 0;
+  try {
+    const d = ctx.getImageData(0, 0, w, h).data;
+    for (let y = 0; y < h; y += sampleStep) {
+      for (let x = 0; x < w; x += sampleStep) {
+        total++;
+        if (d[(y * w + x) * 4 + 3] < 128) clear++;
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return total ? clear / total : 0;
+}
+
+const WA_MAX_KB = 100;
+
+/**
+ * Export a genuine WhatsApp-ready sticker:
+ * exactly 512x512 WebP, auto-compressed to <=100KB.
+ * Returns { blob, sizeKB, quality, transparent }.
+ */
+export async function exportWhatsAppSticker(img, opts = {}) {
+  const canvas = await renderSticker(img, { ...opts, size: STICKER_SIZE });
+  const transparent = transparencyRatio(canvas) > 0.02;
+  let quality = 0.88;
+  let blob = await canvasToBlob(canvas, "image/webp", quality);
+  while (blob && blob.size / 1024 > WA_MAX_KB && quality > 0.3) {
+    quality -= 0.1;
+    blob = await canvasToBlob(canvas, "image/webp", quality);
+  }
+  return {
+    blob,
+    canvas,
+    sizeKB: blob ? blob.size / 1024 : 0,
+    quality,
+    transparent,
+    withinLimit: blob ? blob.size / 1024 <= WA_MAX_KB : false,
+  };
+}
+
 export function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

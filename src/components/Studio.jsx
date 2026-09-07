@@ -19,12 +19,14 @@ import {
   STICKER_SIZE,
   canvasToBlob,
   downloadBlob,
+  exportWhatsAppSticker,
   fileToDataURL,
   loadImage,
   loadPack,
   renderSticker,
   savePack,
   shareFiles,
+  transparencyRatio,
 } from "../sticker/engine";
 
 const DEFAULTS = {
@@ -42,29 +44,20 @@ const DEFAULTS = {
   rotation: 0,
 };
 
-function sampleSticker(emoji, bg1, bg2) {
+function sampleSticker(emoji) {
+  // Transparent background so it imports as a real sticker, not a photo
   const c = document.createElement("canvas");
   c.width = 512;
   c.height = 512;
   const x = c.getContext("2d");
-  const g = x.createLinearGradient(0, 0, 512, 512);
-  g.addColorStop(0, bg1);
-  g.addColorStop(1, bg2);
-  x.fillStyle = g;
-  x.fillRect(0, 0, 512, 512);
-  x.font = "340px serif";
+  x.font = "360px serif";
   x.textAlign = "center";
   x.textBaseline = "middle";
   x.fillText(emoji, 256, 290);
   return c.toDataURL("image/png");
 }
 
-const SAMPLES = [
-  { emoji: "🤪", bg1: "#25D366", bg2: "#0d9463" },
-  { emoji: "💀", bg1: "#8B5CF6", bg2: "#EC4899" },
-  { emoji: "🔥", bg1: "#f59e0b", bg2: "#ef4444" },
-  { emoji: "😭", bg1: "#38bdf8", bg2: "#6366f1" },
-];
+const SAMPLES = [{ emoji: "🤪" }, { emoji: "💀" }, { emoji: "🔥" }, { emoji: "😭" }];
 
 function Btn({ children, onClick, primary, ghost, disabled, small }) {
   return (
@@ -121,6 +114,7 @@ export default function Studio() {
   const [pack, setPack] = useState(() => loadPack());
   const [dragOver, setDragOver] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [waInfo, setWaInfo] = useState(null); // { sizeKB, transparent, withinLimit }
   const previewRef = useRef(null);
   const exportRef = useRef(null); // latest 512 canvas
   const fileRef = useRef(null);
@@ -153,6 +147,17 @@ export default function Studio() {
       pc.getContext("2d").clearRect(0, 0, 360, 360);
       pc.getContext("2d").drawImage(preview, 0, 0);
       exportRef.current = await renderSticker(img, { ...opts, size: STICKER_SIZE });
+      // Live WhatsApp-readiness check on the real 512 export
+      try {
+        const probe = await canvasToBlob(exportRef.current, "image/webp", 0.85);
+        setWaInfo({
+          sizeKB: probe ? probe.size / 1024 : 0,
+          transparent: transparencyRatio(exportRef.current) > 0.02,
+          withinLimit: probe ? probe.size / 1024 <= 100 : false,
+        });
+      } catch {
+        setWaInfo(null);
+      }
     } finally {
       setBusy(false);
     }
@@ -197,21 +202,37 @@ export default function Studio() {
   };
 
   const addToPack = async () => {
-    if (!exportRef.current) return;
-    const blob = await canvasToBlob(exportRef.current, "image/webp", 0.85);
-    if (!blob) return flash("Export failed — try again.");
-    const url = await fileToDataURL(new File([blob], "sticker.webp", { type: "image/webp" }));
-    const item = { id: Date.now(), url, at: new Date().toISOString() };
-    setPack((p) => [item, ...p].slice(0, 24));
-    flash("Added to pack! Keep cooking 👇");
+    if (!img) return;
+    setBusy(true);
+    try {
+      const { blob } = await exportWhatsAppSticker(img, opts);
+      if (!blob) return flash("Export failed — try again.");
+      const url = await fileToDataURL(new File([blob], "sticker.webp", { type: "image/webp" }));
+      const item = { id: Date.now(), url, at: new Date().toISOString() };
+      setPack((p) => [item, ...p].slice(0, 30));
+      flash("Added to pack! Keep cooking 👇");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const downloadOne = async (type) => {
-    if (!exportRef.current) return;
-    const mime = type === "png" ? "image/png" : "image/webp";
-    const blob = await canvasToBlob(exportRef.current, mime, 0.88);
-    downloadBlob(blob, `stickme-${Date.now()}.${type === "png" ? "png" : "webp"}`);
-    flash(`Downloaded ${type.toUpperCase()} (512×512, WhatsApp-ready)`);
+    if (!img) return;
+    setBusy(true);
+    try {
+      if (type === "png") {
+        const canvas = await renderSticker(img, { ...opts, size: STICKER_SIZE });
+        const blob = await canvasToBlob(canvas, "image/png");
+        downloadBlob(blob, `stickme-${Date.now()}.png`);
+        flash("Downloaded HD PNG (for editing — packs need WebP)");
+      } else {
+        const { blob, sizeKB } = await exportWhatsAppSticker(img, opts);
+        downloadBlob(blob, `stickme-${Date.now()}.webp`);
+        flash(`Downloaded real sticker — 512×512 WebP, ${Math.round(sizeKB)}KB ✅`);
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   const copySticker = async () => {
@@ -227,11 +248,13 @@ export default function Studio() {
 
   const shareSticker = async () => {
     try {
-      if (!exportRef.current) return;
-      const blob = await canvasToBlob(exportRef.current, "image/webp", 0.88);
+      if (!img) return;
+      // NOTE: phone share sheets send this as an image file — to get a true
+      // sticker it must go through WhatsApp's Create / Add-to-pack flow below.
+      const { blob } = await exportWhatsAppSticker(img, opts);
       const file = new File([blob], "stickme-sticker.webp", { type: "image/webp" });
       const r = await shareFiles([file]);
-      if (r === "unsupported") flash("Share sheet unavailable — use Download.");
+      if (r === "unsupported") flash("Share sheet unavailable — use Download sticker.");
     } catch {
       /* user cancelled */
     }
@@ -324,11 +347,11 @@ export default function Studio() {
                 <button
                   key={s.emoji}
                   type="button"
-                  onClick={() => setSrc(sampleSticker(s.emoji, s.bg1, s.bg2))}
-                  className="group overflow-hidden rounded-2xl border border-white/10 transition-transform hover:scale-105"
+                  onClick={() => setSrc(sampleSticker(s.emoji))}
+                  className="group overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] transition-transform hover:scale-105"
                   aria-label={`Try sample ${s.emoji}`}
                 >
-                  <span className="grid aspect-square place-items-center text-6xl" style={{ background: `linear-gradient(135deg, ${s.bg1}, ${s.bg2})` }}>
+                  <span className="grid aspect-square place-items-center text-6xl">
                     {s.emoji}
                   </span>
                 </button>
@@ -363,10 +386,27 @@ export default function Studio() {
                   <Loader2 size={15} className="animate-spin" aria-hidden="true" /> rendering…
                 </p>
               )}
+              {/* WhatsApp spec badge — this is what decides sticker vs photo */}
+              {waInfo && (
+                <div className="mx-auto mt-4 flex w-fit flex-wrap items-center justify-center gap-2 text-xs font-bold" role="status">
+                  <span className="rounded-full bg-white/10 px-3 py-1.5">512×512</span>
+                  <span className={`rounded-full px-3 py-1.5 ${waInfo.withinLimit ? "bg-[#25D366]/20 text-lime-300" : "bg-amber-400/20 text-amber-300"}`}>
+                    {Math.round(waInfo.sizeKB)}KB {waInfo.withinLimit ? "✓" : "— auto-shrunk on download"}
+                  </span>
+                  <span className={`rounded-full px-3 py-1.5 ${waInfo.transparent ? "bg-[#25D366]/20 text-lime-300" : "bg-amber-400/20 text-amber-300"}`}>
+                    {waInfo.transparent ? "transparent ✓ real sticker" : "no transparency ⚠ may send as photo"}
+                  </span>
+                </div>
+              )}
+              {!waInfo?.transparent && !busy && (
+                <p className="mx-auto mt-3 max-w-sm text-[13px] leading-relaxed text-amber-300/90">
+                  Tip: turn on <strong>Remove background</strong> so WhatsApp sees a sticker, not a square photo.
+                </p>
+              )}
               <div className="mt-5 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
                 <Btn primary small onClick={addToPack}><PackagePlus size={15} aria-hidden="true" /> Add to pack</Btn>
-                <Btn small onClick={() => downloadOne("webp")}><Download size={15} aria-hidden="true" /> WebP</Btn>
-                <Btn small onClick={() => downloadOne("png")}>PNG</Btn>
+                <Btn small onClick={() => downloadOne("webp")}><Download size={15} aria-hidden="true" /> Sticker .webp</Btn>
+                <Btn small onClick={() => downloadOne("png")}>HD .png</Btn>
                 <Btn small onClick={shareSticker}><Share2 size={15} aria-hidden="true" /> Share</Btn>
               </div>
               <div className="mt-2.5 grid grid-cols-2 gap-2.5">
@@ -455,16 +495,34 @@ export default function Studio() {
             </div>
 
             <button type="button" onClick={() => setShowHelp((v) => !v)} aria-expanded={showHelp}
-              className="glass w-full rounded-3xl px-6 py-4 text-left font-bold hover:bg-white/[0.07]">
-              {showHelp ? "Hide" : "Show"}: how to get these into WhatsApp 👇
+              className="glass w-full rounded-3xl bg-[#25D366]/10 px-6 py-4 text-left font-bold hover:bg-[#25D366]/15">
+              {showHelp ? "Hide" : "Show"}: get this INTO WhatsApp as a sticker (2 min) 👇
             </button>
             {showHelp && (
-              <ol className="glass list-decimal space-y-2.5 rounded-3xl p-6 pl-11 text-sm leading-relaxed text-slate-300">
-                <li><strong className="text-white">Download WebP</strong> (or Add to pack → Download pack ZIP).</li>
-                <li>Open <strong className="text-white">WhatsApp → Stickers → ＋ → Create</strong> and import the file. On desktop, drag the PNG straight into chat, right-click → <em>Create sticker</em>.</li>
-                <li>Fastest on PC: hit <strong className="text-white">Copy</strong> then paste (Ctrl+V) directly into WhatsApp Web.</li>
-                <li>On phone: use <strong className="text-white">Share → WhatsApp</strong> to send instantly to any chat.</li>
-              </ol>
+              <div className="glass space-y-5 rounded-3xl p-6 text-sm leading-relaxed text-slate-300">
+                <p className="rounded-2xl bg-amber-400/10 px-4 py-3 text-[13px] text-amber-200">
+                  Why this step exists: sending a file <em>to</em> a chat always arrives as a photo.
+                  A sticker only happens when the file enters through WhatsApp's sticker doors below —
+                  with a transparent background, 512×512, under 100KB (this studio exports exactly that ✅).
+                </p>
+                <div>
+                  <p className="font-bold text-white">📱 Phone → into a real sticker pack (recommended)</p>
+                  <ol className="mt-2 list-decimal space-y-1.5 pl-5">
+                    <li>Hit <strong className="text-white">Sticker .webp → save to gallery/files</strong> (need 3+ stickers for a pack).</li>
+                    <li>Open any WhatsApp chat → <strong className="text-white">sticker icon → Create → pick your saved file</strong> → send it.</li>
+                    <li><strong className="text-white">Tap &amp; hold the sent sticker → Add to sticker pack → New</strong>, name it, Save. Done — it's a real sticker now.</li>
+                    <li>Repeat: send each sticker → Add to sticker pack → same pack (up to 30).</li>
+                  </ol>
+                </div>
+                <div>
+                  <p className="font-bold text-white">💻 PC → send as a sticker on WhatsApp Web</p>
+                  <ol className="mt-2 list-decimal space-y-1.5 pl-5">
+                    <li>Hit <strong className="text-white">Copy</strong>, then paste (Ctrl+V) into WhatsApp Web — or download the .webp and drag it in.</li>
+                    <li>Choose the <strong className="text-white">sticker / Create sticker</strong> option (not “photo”) before sending.</li>
+                    <li>Sent stickers auto-save to your tray and sync to your phone.</li>
+                  </ol>
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -475,8 +533,7 @@ export default function Studio() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="font-display text-2xl font-bold sm:text-3xl">
             Your pack {pack.length > 0 && <span className="text-lime-300">({pack.length})</span>}
-          </h2>
-          {pack.length > 0 && (
+          </h2>          {pack.length > 0 && (
             <div className="flex gap-2">
               <Btn ghost small onClick={downloadPackZip}><Download size={15} aria-hidden="true" /> ZIP pack</Btn>
               <Btn ghost small onClick={() => setPack([])}><Trash2 size={15} aria-hidden="true" /> Clear</Btn>
@@ -488,6 +545,11 @@ export default function Studio() {
             Nothing here yet — make a sticker and hit <strong className="text-white">“Add to pack”</strong>. Your pack auto-saves in this browser.
           </p>
         ) : (
+          <>
+            <p className="mt-3 text-[13px] text-slate-400">
+              Every file here is 512×512 WebP, under 100KB — exactly what WhatsApp's sticker-pack upload accepts.
+              WhatsApp packs need 3–30 stickers.
+            </p>
           <ul className="mt-5 grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6">
             {pack.map((s, i) => (
               <li key={s.id} className="group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
@@ -502,6 +564,7 @@ export default function Studio() {
               </li>
             ))}
           </ul>
+          </>
         )}
       </section>
     </div>
